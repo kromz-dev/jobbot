@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
-from . import intel
+from . import extensions, intel
 from .paths import DB_PATH
 
 MISSES_BEFORE_CLOSED = 2
@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS status_history (
 CREATE TABLE IF NOT EXISTS dedup_blocks (
   url TEXT NOT NULL, offer_id INTEGER NOT NULL, PRIMARY KEY (url, offer_id)
 );
+
+CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT);
 """
 
 STATUSES = {"", "vu", "favori", "postule", "relance", "entretien", "offre", "refuse", "masque"}
@@ -153,6 +155,13 @@ def retry_io(func):
 def init(path: Path | str | None = None) -> None:
     with _write_lock, connect(path) as c:
         c.executescript(SCHEMA)
+        for sql in extensions.SCHEMAS:
+            c.executescript(sql)
+        applied = {r["name"] for r in c.execute("SELECT name FROM migrations")}
+        for name, sql in extensions.MIGRATIONS:
+            if name not in applied:
+                c.executescript(sql)
+                c.execute("INSERT INTO migrations (name, applied_at) VALUES (?, ?)", (name, now_iso()))
 
 
 def _days_old(posted: str | None) -> int | None:
@@ -530,7 +539,10 @@ def list_offers(include_inactive: bool = True, path=None) -> list[dict]:
         history = defaultdict(list)
         for h in c.execute("SELECT offer_id, status, at FROM status_history ORDER BY id"):
             history[h["offer_id"]].append({"status": h["status"], "at": h["at"]})
-    return [_offer_dict(o, listings[o["id"]], history[o["id"]]) for o in offers]
+    result = [_offer_dict(o, listings[o["id"]], history[o["id"]]) for o in offers]
+    for decorate in extensions.OFFER_DECORATORS:
+        decorate(result)
+    return result
 
 
 @retry_io

@@ -40,7 +40,12 @@ SOURCE_TERMS = [
     "aide soignant faisant fonction",
 ]
 
-ALL_SOURCES = ["Indeed", *SOURCES.keys()]
+def all_sources() -> list[str]:
+    """Sources disponibles, y compris celles ajoutées par une fonctionnalité."""
+    return ["Indeed", *SOURCES.keys()]
+
+
+ALL_SOURCES = all_sources()  # compatibilité : valeur au démarrage
 
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int, str], None]
@@ -57,6 +62,7 @@ DEFAULT_CONFIG: dict = {
     "max_pages": 3,
     "enrich": True,
     "max_enrich": 200,
+    "integrations": {},       # identifiants d'API optionnels, ex. {"francetravail": {"client_id": "…"}}
 }
 
 
@@ -73,7 +79,10 @@ def normalize_config(raw: dict | None) -> dict:
         val = raw.get(key)
         if isinstance(val, list):
             cfg[key] = list(dict.fromkeys(str(x).strip() for x in val if str(x).strip()))
-    cfg["sources"] = [src for src in cfg["sources"] if src in ALL_SOURCES]
+    available = all_sources()
+    if "sources" not in raw:
+        cfg["sources"] = available
+    cfg["sources"] = [src for src in cfg["sources"] if src in available]
 
     for key, lo, hi in (("radius_km", 1, 100), ("max_pages", 1, 10), ("max_enrich", 0, 1000)):
         try:
@@ -92,6 +101,13 @@ def normalize_config(raw: dict | None) -> dict:
             except (TypeError, ValueError):
                 continue
     cfg["city_radius"] = {c: r for c, r in city_radius.items() if c in cfg["cities"] and r != cfg["radius_km"]}
+
+    integrations = raw.get("integrations")
+    cfg["integrations"] = {
+        str(name): {str(k): str(v)[:500] for k, v in values.items()}
+        for name, values in (integrations.items() if isinstance(integrations, dict) else [])
+        if isinstance(values, dict)
+    }
     return cfg
 
 
