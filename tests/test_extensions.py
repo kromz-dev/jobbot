@@ -1,7 +1,12 @@
 import json
 import threading
+import time
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
 
 from jobbot import db, extensions, pipeline, scraper, server
 from jobbot.sources import SOURCES
@@ -42,6 +47,26 @@ def test_schema_and_migration_applied_once(clean_extensions, tmp_path, monkeypat
     db._reset(path)
 
 
+def test_offer_decorators_applied_on_get_and_update_offer(clean_extensions, tmp_db):
+    run = db.start_run({})
+    db.ingest([{"apply_url": "https://x/1", "source": "Hellowork", "title": "Aide-soignant", "company": "A",
+                "location": "Pamiers - 09", "search_hub": "Pamiers"}], run)
+    oid = db.list_offers()[0]["id"]
+
+    @extensions.offer_decorator
+    def tag(offers):
+        for o in offers:
+            o["tagged"] = True
+
+    assert db.get_offer(oid)["tagged"] is True
+    assert db.update_offer(oid, note="x")["tagged"] is True
+
+
+def test_migration_rejects_invalid_name(clean_extensions):
+    with pytest.raises(ValueError):
+        extensions.migration("bad name; DROP TABLE offers", "ALTER TABLE demo ADD COLUMN x TEXT")
+
+
 def test_offer_decorators_run_in_list_offers(clean_extensions, tmp_db):
     run = db.start_run({})
     db.ingest([{"apply_url": "https://x/1", "source": "Hellowork", "title": "Aide-soignant", "company": "A",
@@ -80,6 +105,23 @@ def test_post_run_hooks_isolate_errors(clean_extensions):
     assert any("broken" in line and "boum" in line for line in logs)
 
 
+def test_load_features_skips_broken_module(clean_extensions, tmp_path, monkeypatch):
+    import jobbot.features as pkg
+
+    (tmp_path / "zz_good.py").write_text(
+        "from jobbot import extensions\n@extensions.route('GET', r'/api/zz-good')\ndef h(req, m, q, b):\n    return 200, {}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "zz_bad.py").write_text("raise RuntimeError('boum')\n", encoding="utf-8")
+    monkeypatch.setattr(pkg, "__path__", [str(tmp_path)])
+    loaded = extensions.load_features()
+    assert loaded == ["zz_good"]
+    assert len(extensions.FAILED_FEATURES) == 1
+    name, error = extensions.FAILED_FEATURES[0]
+    assert name == "zz_bad"
+    assert "boum" in error
+
+
 def test_load_features_imports_modules(clean_extensions, tmp_path, monkeypatch):
     import jobbot.features as pkg
 
@@ -111,6 +153,19 @@ def test_public_config_masks_secrets():
     assert cfg["integrations"]["francetravail"]["client_secret"] == "s3cr3t-value-1234"  # original intact
 
 
+def test_public_config_masks_api_key_but_not_client_id():
+    cfg = {"integrations": {"demo": {"client_id": "PAR_abc", "api_key": "s3cr3t-value-1234"}}}
+    pub = server.public_config(cfg)
+    assert pub["integrations"]["demo"]["client_id"] == "PAR_abc"
+    assert pub["integrations"]["demo"]["api_key"] == "••••1234"
+
+
+def test_public_config_masks_short_secret_fully():
+    cfg = {"integrations": {"francetravail": {"client_secret": "short1"}}}
+    pub = server.public_config(cfg)
+    assert pub["integrations"]["francetravail"]["client_secret"] == server.MASK
+
+
 def test_save_config_preserves_integrations_and_masked_secrets(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "CONFIG_PATH", tmp_path / "config.json")
     server.save_config({"integrations": {"francetravail": {"client_id": "id1", "client_secret": "real-secret-9999"}}})
@@ -119,6 +174,36 @@ def test_save_config_preserves_integrations_and_masked_secrets(monkeypatch, tmp_
     server.save_config({"integrations": {"francetravail": {"client_id": "id2", "client_secret": "••••9999"}}})
     saved = server.load_config()["integrations"]["francetravail"]
     assert saved == {"client_id": "id2", "client_secret": "real-secret-9999"}
+
+
+def test_save_config_ignores_non_dict_integration_entries(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "CONFIG_PATH", tmp_path / "config.json")
+    cfg = server.save_config({"integrations": {"demo": {"client_id": "x"}, "broken": "not-a-dict"}})
+    assert cfg["integrations"]["demo"]["client_id"] == "x"
+    assert "broken" not in cfg["integrations"] or cfg["integrations"]["broken"] == {}
+
+
+def test_save_config_serializes_concurrent_writes(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "CONFIG_PATH", tmp_path / "config.json")
+    server.save_config({"radius_km": 1})
+    original_write_text = Path.write_text
+    active = {"n": 0}
+    overlap = []
+
+    def slow_write_text(self, *a, **k):
+        active["n"] += 1
+        overlap.append(active["n"])
+        time.sleep(0.05)
+        active["n"] -= 1
+        return original_write_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", slow_write_text)
+    threads = [threading.Thread(target=server.save_config, args=({"radius_km": i},)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert max(overlap) == 1  # jamais deux écritures en même temps : pas de lecture-fusion-écriture concurrente
 
 
 def test_registered_route_served_over_http(clean_extensions, tmp_db, monkeypatch, tmp_path):
@@ -135,6 +220,39 @@ def test_registered_route_served_over_http(clean_extensions, tmp_db, monkeypatch
             assert json.loads(r.read()) == {"name": "abc", "body": {"x": 1}}
     finally:
         httpd.shutdown()
+        httpd.server_close()
+
+
+def test_pipeline_run_never_persists_secrets(clean_extensions, tmp_db, monkeypatch, tmp_path):
+    monkeypatch.setattr(pipeline, "scrape_all", lambda **kw: [])
+    monkeypatch.setattr(pipeline, "CSV_PATH", tmp_path / "out.csv")
+    monkeypatch.setattr(pipeline, "JSON_PATH", tmp_path / "out.json")
+    cfg = {"sources": ["Hellowork"], "cities": ["Paris"], "integrations": {"francetravail": {"client_secret": "s3cr3t-value"}}}
+    pipeline.run(cfg)
+    runs = db.list_runs()
+    assert "integrations" not in runs[0]["config"]
+    assert runs[0]["config"]["cities"] == ["Paris"]
+
+
+def test_dispatch_returns_500_json_for_non_serializable_payload(clean_extensions, tmp_db, monkeypatch, tmp_path):
+    @extensions.route("GET", r"/api/broken")
+    def broken(req, match, query, body):
+        return 200, {"nope": {1, 2, 3}}  # un set n'est pas sérialisable en JSON
+
+    httpd, base = _serve(monkeypatch, tmp_path)
+    try:
+        req = urllib.request.Request(f"{base}/api/broken")
+        try:
+            with urllib.request.urlopen(req) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            status = e.code
+            body = json.loads(e.read())
+            assert "error" in body
+        assert status == 500
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_feature_script_served_and_injected(tmp_db, monkeypatch, tmp_path):
@@ -150,3 +268,4 @@ def test_feature_script_served_and_injected(tmp_db, monkeypatch, tmp_path):
             assert r.read() == b"window.__demo = 1;"
     finally:
         httpd.shutdown()
+        httpd.server_close()

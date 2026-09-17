@@ -8,6 +8,13 @@ const icon = (id, cls = "") => `<svg class="i ${cls}" aria-hidden="true"><use hr
 const fmtInt = (n) => Number(n || 0).toLocaleString("fr-FR");
 const km = (v) => v == null ? "—" : `${String(v).replace(".", ",")} km`;
 const dateFr = (iso, opts = { day: "2-digit", month: "2-digit" }) => { const d = new Date(iso); return isNaN(d) ? "—" : d.toLocaleDateString("fr-FR", opts); };
+/* Une fonctionnalité (crochet, vue additionnelle) peut planter sans jamais casser le cœur de l'appli. */
+function safe(fn, fallback, ...args) {
+  try { return fn(...args); } catch (e) { console.error(e); return fallback; }
+}
+async function safeAsync(fn) {
+  try { await fn(); } catch (e) { console.error(e); }
+}
 
 /* ======================= État ======================= */
 const S = {
@@ -276,7 +283,7 @@ function renderOverview() {
   renderCharts($("view-apercu"));
   $("health-mini").innerHTML = healthTable(true);
   const extras = $("overview-extras");
-  if (extras) { extras.innerHTML = ""; HOOKS.overviewCards.forEach(fn => fn(extras)); }
+  if (extras) { extras.innerHTML = ""; HOOKS.overviewCards.forEach(fn => safe(fn, undefined, extras)); }
 }
 
 /* ======================= Santé des sources ======================= */
@@ -446,7 +453,7 @@ function detailRow(o) {
       </dl>
       <label for="note-${o.id}" style="font-weight:600;font-size:.875rem">Note personnelle</label>
       <textarea id="note-${o.id}" class="note" data-id="${o.id}" placeholder="Contact, date d'appel, questions…">${esc(o.note)}</textarea>
-      ${HOOKS.detailExtras.map(fn => fn(o)).join("")}
+      ${HOOKS.detailExtras.map(fn => safe(fn, "", o)).join("")}
     </div></div></td></tr>`;
 }
 function updateSelection() {
@@ -677,7 +684,7 @@ function renderLog() {
 }
 function renderSearch() {
   if (S.config && !$("cfg-sources").children.length) fillForm(S.config);
-  if (!searchExtrasRendered && $("search-extras")) { searchExtrasRendered = true; HOOKS.searchExtras.forEach(fn => fn($("search-extras"))); }
+  if (!searchExtrasRendered && $("search-extras")) { searchExtrasRendered = true; HOOKS.searchExtras.forEach(fn => safe(fn, undefined, $("search-extras"))); }
   $("health-full").innerHTML = healthTable(false);
   const p = S.data.progress || {};
   $("health-sub").textContent = S.data.running ? `En cours : ${p.label || ""}` : "Dernière recherche";
@@ -738,7 +745,7 @@ function renderHeader() {
   $("nav-dup").textContent = fmtInt(S.offers.filter(o => o.listings.length > 1).length);
   for (const v of EXTRA_VIEWS) {
     const badge = document.querySelector(`nav.tabs a[data-view="${v.id}"] .count`);
-    if (badge && v.count) badge.textContent = fmtInt(v.count());
+    if (badge && v.count) badge.textContent = fmtInt(safe(v.count, 0));
   }
   $("btn-notif").classList.toggle("btn-primary", "Notification" in window && Notification.permission === "granted");
 }
@@ -793,7 +800,7 @@ window.JobBot = {
     section.id = `view-${id}`;
     section.hidden = true;
     document.querySelector("main").appendChild(section);
-    if (bind) bind(section);
+    if (bind) safe(bind, undefined, section);
     if (parseRoute().view === id && S.offers.length) onRoute();
   },
 };
@@ -804,11 +811,11 @@ function renderView() {
   const core = { apercu: renderOverview, offres: renderOffers, candidatures: renderPipeline, employeurs: renderEmployers,
     doublons: renderDuplicates, recherche: renderSearch, historique: renderHistory };
   if (core[S.view]) core[S.view]();
-  else if (VIEW_RENDERERS[S.view]) VIEW_RENDERERS[S.view]($(`view-${S.view}`));
+  else if (VIEW_RENDERERS[S.view]) safe(VIEW_RENDERERS[S.view], undefined, $(`view-${S.view}`));
 }
 async function refreshData() {
   await loadData();
-  for (const fn of HOOKS.afterLoad) await fn();
+  for (const fn of HOOKS.afterLoad) await safeAsync(fn);
   S.version = S.data.data_version;
   renderView();
 }

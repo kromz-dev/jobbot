@@ -60,7 +60,7 @@ def run(
 
     stopped = lambda: bool(stop_flag and stop_flag())  # noqa: E731
     db.init()
-    run_id = db.start_run(cfg, trigger=trigger)
+    run_id = db.start_run({k: v for k, v in cfg.items() if k != "integrations"}, trigger=trigger)
     summary: dict = {"run_id": run_id}
     try:
         listings = scrape_all(on_log=log, on_progress=on_progress, stop_flag=stop_flag, config=cfg, on_stat=keep_stats)

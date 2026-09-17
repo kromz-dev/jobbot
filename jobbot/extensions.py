@@ -9,6 +9,17 @@ Points d'extension. Une fonctionnalité (jobbot/features/<nom>.py) s'y enregistr
 
 Le serveur charge automatiquement toutes les fonctionnalités au démarrage (load_features).
 Ce module ne doit importer aucun autre module de jobbot (évite les imports circulaires).
+
+Contrat pour les fonctionnalités :
+  - schema() est idempotent (CREATE TABLE/INDEX IF NOT EXISTS…), rejoué à chaque db.init() ; migration() est
+    à usage unique (ALTER TABLE…), mémorisé dans la table migrations et jamais rejoué. Ne jamais déclarer la
+    même colonne dans les deux : schema() pour une nouvelle table, migration() pour modifier une table existante.
+  - Les décorateurs d'offres (offer_decorator) doivent accepter une liste de longueur quelconque — y compris
+    vide ou à un seul élément (db.get_offer() les applique à une liste à un élément).
+  - Le HTML renvoyé par les crochets hooks.detailExtras / hooks.overviewCards (front, jobbot/web/app.js) doit
+    systématiquement échapper les données utilisateur avec JobBot.esc.
+  - Les crochets peuvent échouer sans jamais casser le cœur de l'application (routes, migrations, rendu de
+    base) : chaque appel de crochet est isolé (try/except côté Python, safe() côté front).
 """
 
 from __future__ import annotations
@@ -32,7 +43,8 @@ SCHEMAS: list[str] = []
 MIGRATIONS: list[tuple[str, str]] = []
 POST_RUN_HOOKS: list[Callable] = []
 OFFER_DECORATORS: list[Callable[[list[dict]], None]] = []
-REGISTRIES = ["ROUTES", "SCHEMAS", "MIGRATIONS", "POST_RUN_HOOKS", "OFFER_DECORATORS"]
+FAILED_FEATURES: list[tuple[str, str]] = []  # (nom, erreur) — rempli par load_features()
+REGISTRIES = ["ROUTES", "SCHEMAS", "MIGRATIONS", "POST_RUN_HOOKS", "OFFER_DECORATORS", "FAILED_FEATURES"]
 
 
 def route(method: str, pattern: str):
@@ -60,6 +72,8 @@ def schema(sql: str) -> None:
 
 def migration(name: str, sql: str) -> None:
     """SQL non idempotent (ALTER TABLE …) exécuté une seule fois, mémorisé dans la table migrations."""
+    if not re.fullmatch(r"\w+", name):
+        raise ValueError(f"Nom de migration invalide (attendu : lettres/chiffres/_) : {name!r}")
     if name not in {n for n, _ in MIGRATIONS}:
         MIGRATIONS.append((name, sql))
 
@@ -71,18 +85,26 @@ def post_run(fn: Callable) -> Callable:
 
 
 def offer_decorator(fn: Callable[[list[dict]], None]) -> Callable[[list[dict]], None]:
-    """fn(offers) enrichit en place la liste renvoyée par db.list_offers()."""
+    """fn(offers) enrichit en place la liste renvoyée par db.list_offers() ET db.get_offer() (liste à un élément).
+    Doit accepter une liste de longueur quelconque, y compris vide ou à un seul élément."""
     OFFER_DECORATORS.append(fn)
     return fn
 
 
 def load_features() -> list[str]:
-    """Importe chaque module de jobbot.features (hors noms commençant par « _ »)."""
+    """Importe chaque module de jobbot.features (hors noms commençant par « _ »).
+    Un module qui échoue à l'import est ignoré et consigné dans FAILED_FEATURES : une fonctionnalité
+    cassée ne doit jamais empêcher le démarrage du serveur ni le chargement des autres fonctionnalités."""
     import jobbot.features as pkg
 
     names = []
+    FAILED_FEATURES.clear()
     for mod in pkgutil.iter_modules(pkg.__path__):
         if not mod.name.startswith("_"):
-            importlib.import_module(f"jobbot.features.{mod.name}")
-            names.append(mod.name)
+            try:
+                importlib.import_module(f"jobbot.features.{mod.name}")
+            except Exception as e:  # noqa: BLE001 — une fonctionnalité cassée ne doit pas bloquer le démarrage
+                FAILED_FEATURES.append((mod.name, str(e)[:300]))
+            else:
+                names.append(mod.name)
     return sorted(names)

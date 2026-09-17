@@ -28,7 +28,7 @@ STATIC_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=
 MAX_LOGS = 800
 
 FEATURES_WEB_DIR = WEB / "features"
-SECRET_KEYS = ("secret", "token", "password")
+SECRET_KEYS = ("secret", "token", "password", "key")
 MASK = "••••"
 
 
@@ -41,13 +41,17 @@ def _is_secret(key: str) -> bool:
     return any(s in key.lower() for s in SECRET_KEYS)
 
 
+def _masked(key: str, v):
+    if not (_is_secret(key) and v):
+        return v
+    return MASK + v[-4:] if len(str(v)) > 8 else MASK
+
+
 def public_config(cfg: dict) -> dict:
     """Copie de la config sans exposer les secrets au navigateur."""
     out = {**cfg, "integrations": {}}
     for name, values in (cfg.get("integrations") or {}).items():
-        out["integrations"][name] = {
-            k: (MASK + v[-4:] if _is_secret(k) and v else v) for k, v in values.items()
-        }
+        out["integrations"][name] = {k: _masked(k, v) for k, v in values.items()}
     return out
 
 state = {
@@ -82,21 +86,27 @@ def load_config() -> dict:
     return cfg
 
 
+_config_lock = threading.Lock()
+
+
 def save_config(raw: dict) -> dict:
-    previous = load_config().get("integrations", {})
-    raw = dict(raw)
-    if "integrations" not in raw:
-        raw["integrations"] = previous
-    else:
-        merged = {}
-        for name, values in (raw.get("integrations") or {}).items():
-            old = previous.get(name, {})
-            merged[name] = {k: (old.get(k, "") if str(v).startswith(MASK) else v) for k, v in values.items()}
-        raw["integrations"] = {**previous, **merged}
-    cfg = normalize_config(raw)
-    cfg["schedule"] = {**SCHEDULE_DEFAULT, **(raw.get("schedule") or {})}
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    return load_config()
+    with _config_lock:  # sérialise la lecture-fusion-écriture : deux sauvegardes concurrentes ne s'écrasent pas
+        previous = load_config().get("integrations", {})
+        raw = dict(raw)
+        if "integrations" not in raw:
+            raw["integrations"] = previous
+        else:
+            merged = {}
+            for name, values in (raw.get("integrations") or {}).items():
+                if not isinstance(values, dict):
+                    continue
+                old = previous.get(name, {})
+                merged[name] = {k: (old.get(k, "") if str(v).startswith(MASK) else v) for k, v in values.items()}
+            raw["integrations"] = {**previous, **merged}
+        cfg = normalize_config(raw)
+        cfg["schedule"] = {**SCHEDULE_DEFAULT, **(raw.get("schedule") or {})}
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return load_config()
 
 
 def push_log(msg: str) -> None:
@@ -318,15 +328,17 @@ class Handler(BaseHTTPRequestHandler):
         route, match = found
         try:
             status, payload = route.handler(self, match, query, body)
+            self._json(status, payload)  # dans le try : un payload non sérialisable renvoie un 500 JSON, pas une connexion coupée
         except Exception as e:
-            status, payload = 500, {"error": f"{route.handler.__name__}: {str(e)[:300]}"}
-        self._json(status, payload)
+            self._json(500, {"error": f"{route.handler.__name__}: {str(e)[:300]}"})
 
 
 def boot() -> None:
     features = extensions.load_features()
     if features:
         print(f"Fonctionnalités : {', '.join(features)}")
+    for name, error in extensions.FAILED_FEATURES:
+        print(f"Fonctionnalité ignorée (erreur) : {name} — {error}")
     db.init()
     msg = db.import_legacy(JSON_PATH, DATA_DIR / "suivi.json", DATA_DIR / "historique.json")
     if msg:

@@ -45,4 +45,5 @@ def test_feature_view_and_hooks_render(tmp_db, monkeypatch, tmp_path):
             browser.close()
     finally:
         httpd.shutdown()
+        httpd.server_close()
     assert errors == []

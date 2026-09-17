@@ -160,8 +160,9 @@ def init(path: Path | str | None = None) -> None:
         applied = {r["name"] for r in c.execute("SELECT name FROM migrations")}
         for name, sql in extensions.MIGRATIONS:
             if name not in applied:
-                c.executescript(sql)
-                c.execute("INSERT INTO migrations (name, applied_at) VALUES (?, ?)", (name, now_iso()))
+                # BEGIN/COMMIT explicites dans le même executescript : l'ALTER et l'enregistrement de la
+                # migration sont atomiques (un crash entre les deux ne rejoue jamais un ALTER déjà appliqué).
+                c.executescript(f"BEGIN;\n{sql};\nINSERT INTO migrations (name, applied_at) VALUES ('{name}', '{now_iso()}');\nCOMMIT;")
 
 
 def _days_old(posted: str | None) -> int | None:
@@ -202,7 +203,9 @@ def list_runs(limit: int = 200, path=None) -> list[dict]:
     out = []
     for r in rows:
         d = dict(r)
-        d["config"] = json.loads(d.pop("config_json") or "{}")
+        config = json.loads(d.pop("config_json") or "{}")
+        config.pop("integrations", None)  # jamais de secrets dans l'historique (couvre aussi les anciennes lignes)
+        d["config"] = config
         d["per_source"] = json.loads(d.pop("per_source_json") or "{}")
         out.append(d)
     return out
@@ -553,7 +556,10 @@ def get_offer(offer_id: int, path=None) -> dict | None:
             return None
         listings = [dict(r) for r in c.execute("SELECT * FROM listings WHERE offer_id = ? ORDER BY id", (offer_id,))]
         history = [dict(h) for h in c.execute("SELECT status, at FROM status_history WHERE offer_id = ? ORDER BY id", (offer_id,))]
-    return _offer_dict(o, listings, history)
+    result = [_offer_dict(o, listings, history)]
+    for decorate in extensions.OFFER_DECORATORS:
+        decorate(result)
+    return result[0]
 
 
 def companies(path=None) -> list[dict]:
