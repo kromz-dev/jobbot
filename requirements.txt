@@ -1,0 +1,7 @@
+# Installation recommandée : pip install -e .   (voir pyproject.toml)
+python-jobspy>=1.1.82
+pandas>=2.1
+curl_cffi>=0.7
+beautifulsoup4>=4.12
+lxml>=5.0
+rapidfuzz>=3.0

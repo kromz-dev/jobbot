@@ -1,0 +1,27 @@
+# Données personnelles et résultats (jamais versionnés)
+data/
+*.db
+*.db-journal
+config.json
+offres_*.csv
+offres_*.json
+suivi.json
+historique.json
+geo_cache.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Éditeurs / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

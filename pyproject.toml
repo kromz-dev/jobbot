@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jobbot"
+version = "3.0.0"
+description = "Recherche d'emploi locale et intelligente pour aides-soignants : 5 sites, dédoublonnage, score expliqué, suivi de candidatures."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "kromzdev" }]
+requires-python = ">=3.10"
+keywords = ["emploi", "aide-soignant", "scraping", "job-search", "france-travail", "dashboard"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Natural Language :: French",
+  "Environment :: Web Environment",
+  "Topic :: Office/Business",
+]
+dependencies = [
+  "python-jobspy>=1.1.82",
+  "pandas>=2.1",
+  "curl_cffi>=0.7",
+  "beautifulsoup4>=4.12",
+  "lxml>=5.0",
+  "rapidfuzz>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+jobbot = "jobbot.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/kromz-dev/jobbot"
+Issues = "https://github.com/kromz-dev/jobbot/issues"
+
+[tool.setuptools.packages.find]
+include = ["jobbot*"]
+
+[tool.setuptools.package-data]
+jobbot = ["web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 150
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E731", "SIM105", "B008"]
