@@ -178,10 +178,12 @@ def _days_old(posted: str | None) -> int | None:
 
 @retry_io
 def start_run(config: dict, trigger: str = "manuel", path=None) -> int:
+    safe_config = dict(config)
+    safe_config.pop("integrations", None)
     with _write_lock, connect(path) as c:
         cur = c.execute(
             "INSERT INTO runs (started_at, config_json, trigger) VALUES (?, ?, ?)",
-            (now_iso(), json.dumps(config, ensure_ascii=False), trigger),
+            (now_iso(), json.dumps(safe_config, ensure_ascii=False), trigger),
         )
         return int(cur.lastrowid)
 
