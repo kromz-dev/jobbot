@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 
-from . import intel
+from . import extensions, intel
 from .paths import DB_PATH
 
 MISSES_BEFORE_CLOSED = 2
@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS status_history (
 CREATE TABLE IF NOT EXISTS dedup_blocks (
   url TEXT NOT NULL, offer_id INTEGER NOT NULL, PRIMARY KEY (url, offer_id)
 );
+
+CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT);
 """
 
 STATUSES = {"", "vu", "favori", "postule", "relance", "entretien", "offre", "refuse", "masque"}
@@ -153,6 +155,14 @@ def retry_io(func):
 def init(path: Path | str | None = None) -> None:
     with _write_lock, connect(path) as c:
         c.executescript(SCHEMA)
+        for sql in extensions.SCHEMAS:
+            c.executescript(sql)
+        applied = {r["name"] for r in c.execute("SELECT name FROM migrations")}
+        for name, sql in extensions.MIGRATIONS:
+            if name not in applied:
+                # BEGIN/COMMIT explicites dans le même executescript : l'ALTER et l'enregistrement de la
+                # migration sont atomiques (un crash entre les deux ne rejoue jamais un ALTER déjà appliqué).
+                c.executescript(f"BEGIN;\n{sql};\nINSERT INTO migrations (name, applied_at) VALUES ('{name}', '{now_iso()}');\nCOMMIT;")
 
 
 def _days_old(posted: str | None) -> int | None:
@@ -168,10 +178,12 @@ def _days_old(posted: str | None) -> int | None:
 
 @retry_io
 def start_run(config: dict, trigger: str = "manuel", path=None) -> int:
+    safe_config = dict(config)
+    safe_config.pop("integrations", None)
     with _write_lock, connect(path) as c:
         cur = c.execute(
             "INSERT INTO runs (started_at, config_json, trigger) VALUES (?, ?, ?)",
-            (now_iso(), json.dumps(config, ensure_ascii=False), trigger),
+            (now_iso(), json.dumps(safe_config, ensure_ascii=False), trigger),
         )
         return int(cur.lastrowid)
 
@@ -193,7 +205,9 @@ def list_runs(limit: int = 200, path=None) -> list[dict]:
     out = []
     for r in rows:
         d = dict(r)
-        d["config"] = json.loads(d.pop("config_json") or "{}")
+        config = json.loads(d.pop("config_json") or "{}")
+        config.pop("integrations", None)  # jamais de secrets dans l'historique (couvre aussi les anciennes lignes)
+        d["config"] = config
         d["per_source"] = json.loads(d.pop("per_source_json") or "{}")
         out.append(d)
     return out
@@ -530,7 +544,10 @@ def list_offers(include_inactive: bool = True, path=None) -> list[dict]:
         history = defaultdict(list)
         for h in c.execute("SELECT offer_id, status, at FROM status_history ORDER BY id"):
             history[h["offer_id"]].append({"status": h["status"], "at": h["at"]})
-    return [_offer_dict(o, listings[o["id"]], history[o["id"]]) for o in offers]
+    result = [_offer_dict(o, listings[o["id"]], history[o["id"]]) for o in offers]
+    for decorate in extensions.OFFER_DECORATORS:
+        decorate(result)
+    return result
 
 
 @retry_io
@@ -541,7 +558,10 @@ def get_offer(offer_id: int, path=None) -> dict | None:
             return None
         listings = [dict(r) for r in c.execute("SELECT * FROM listings WHERE offer_id = ? ORDER BY id", (offer_id,))]
         history = [dict(h) for h in c.execute("SELECT status, at FROM status_history WHERE offer_id = ? ORDER BY id", (offer_id,))]
-    return _offer_dict(o, listings, history)
+    result = [_offer_dict(o, listings, history)]
+    for decorate in extensions.OFFER_DECORATORS:
+        decorate(result)
+    return result[0]
 
 
 def companies(path=None) -> list[dict]:

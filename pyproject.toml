@@ -41,7 +41,7 @@ Issues = "https://github.com/kromz-dev/jobbot/issues"
 include = ["jobbot*"]
 
 [tool.setuptools.package-data]
-jobbot = ["web/*"]
+jobbot = ["web/*", "web/features/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

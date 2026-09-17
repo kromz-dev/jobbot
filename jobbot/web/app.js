@@ -8,6 +8,13 @@ const icon = (id, cls = "") => `<svg class="i ${cls}" aria-hidden="true"><use hr
 const fmtInt = (n) => Number(n || 0).toLocaleString("fr-FR");
 const km = (v) => v == null ? "—" : `${String(v).replace(".", ",")} km`;
 const dateFr = (iso, opts = { day: "2-digit", month: "2-digit" }) => { const d = new Date(iso); return isNaN(d) ? "—" : d.toLocaleDateString("fr-FR", opts); };
+/* Une fonctionnalité (crochet, vue additionnelle) peut planter sans jamais casser le cœur de l'appli. */
+function safe(fn, fallback, ...args) {
+  try { return fn(...args); } catch (e) { console.error(e); return fallback; }
+}
+async function safeAsync(fn) {
+  try { await fn(); } catch (e) { console.error(e); }
+}
 
 /* ======================= État ======================= */
 const S = {
@@ -79,6 +86,10 @@ async function loadData() {
 
 /* ======================= Routage ======================= */
 const VIEWS = ["apercu", "offres", "candidatures", "employeurs", "doublons", "recherche", "historique"];
+const VIEW_RENDERERS = {};
+const EXTRA_VIEWS = [];
+const HOOKS = { detailExtras: [], overviewCards: [], searchExtras: [], afterLoad: [] };
+let searchExtrasRendered = false;
 function parseRoute() {
   const [path, query] = location.hash.replace(/^#\/?/, "").split("?");
   return { view: VIEWS.includes(path) ? path : "apercu", params: new URLSearchParams(query || "") };
@@ -271,6 +282,8 @@ function renderOverview() {
     || `<li class="empty" style="display:block"><strong>Rien d'urgent</strong>Lance une recherche pour trouver de nouvelles offres.</li>`;
   renderCharts($("view-apercu"));
   $("health-mini").innerHTML = healthTable(true);
+  const extras = $("overview-extras");
+  if (extras) { extras.innerHTML = ""; HOOKS.overviewCards.forEach(fn => safe(fn, undefined, extras)); }
 }
 
 /* ======================= Santé des sources ======================= */
@@ -440,6 +453,7 @@ function detailRow(o) {
       </dl>
       <label for="note-${o.id}" style="font-weight:600;font-size:.875rem">Note personnelle</label>
       <textarea id="note-${o.id}" class="note" data-id="${o.id}" placeholder="Contact, date d'appel, questions…">${esc(o.note)}</textarea>
+      ${HOOKS.detailExtras.map(fn => safe(fn, "", o)).join("")}
     </div></div></td></tr>`;
 }
 function updateSelection() {
@@ -670,6 +684,7 @@ function renderLog() {
 }
 function renderSearch() {
   if (S.config && !$("cfg-sources").children.length) fillForm(S.config);
+  if (!searchExtrasRendered && $("search-extras")) { searchExtrasRendered = true; HOOKS.searchExtras.forEach(fn => safe(fn, undefined, $("search-extras"))); }
   $("health-full").innerHTML = healthTable(false);
   const p = S.data.progress || {};
   $("health-sub").textContent = S.data.running ? `En cours : ${p.label || ""}` : "Dernière recherche";
@@ -728,6 +743,10 @@ function renderHeader() {
   $("nav-offres").textContent = fmtInt(visible().length);
   $("nav-cand").textContent = fmtInt(S.offers.filter(o => PIPE.includes(o.status)).length);
   $("nav-dup").textContent = fmtInt(S.offers.filter(o => o.listings.length > 1).length);
+  for (const v of EXTRA_VIEWS) {
+    const badge = document.querySelector(`nav.tabs a[data-view="${v.id}"] .count`);
+    if (badge && v.count) badge.textContent = fmtInt(safe(v.count, 0));
+  }
   $("btn-notif").classList.toggle("btn-primary", "Notification" in window && Notification.permission === "granted");
 }
 function notifyNewOffers() {
@@ -760,13 +779,46 @@ $("btn-theme").addEventListener("click", () => {
 });
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => renderView());
 
+/* ======================= API des fonctionnalités ======================= */
+window.JobBot = {
+  S, api, go, esc, icon, fold, fmtInt, km, dateFr, toast, statusLabel,
+  refreshData: () => refreshData(), renderView: () => renderView(),
+  hooks: HOOKS,
+  registerView({ id, label, render, bind, count }) {
+    if (VIEWS.includes(id)) throw new Error(`Vue déjà existante : ${id}`);
+    VIEWS.push(id);
+    VIEW_RENDERERS[id] = render;
+    EXTRA_VIEWS.push({ id, count });
+    const link = document.createElement("a");
+    link.href = `#/${id}`;
+    link.dataset.view = id;
+    link.innerHTML = `${esc(label)}${count ? ' <span class="count">0</span>' : ""}`;
+    const nav = document.querySelector("nav.tabs");
+    nav.insertBefore(link, nav.querySelector('a[data-view="recherche"]'));
+    const section = document.createElement("section");
+    section.className = "view";
+    section.id = `view-${id}`;
+    section.hidden = true;
+    document.querySelector("main").appendChild(section);
+    if (bind) safe(bind, undefined, section);
+    if (parseRoute().view === id && S.offers.length) onRoute();
+  },
+};
+
 /* ======================= Boucle ======================= */
 function renderView() {
   renderHeader();
-  ({ apercu: renderOverview, offres: renderOffers, candidatures: renderPipeline, employeurs: renderEmployers,
-     doublons: renderDuplicates, recherche: renderSearch, historique: renderHistory })[S.view]();
+  const core = { apercu: renderOverview, offres: renderOffers, candidatures: renderPipeline, employeurs: renderEmployers,
+    doublons: renderDuplicates, recherche: renderSearch, historique: renderHistory };
+  if (core[S.view]) core[S.view]();
+  else if (VIEW_RENDERERS[S.view]) safe(VIEW_RENDERERS[S.view], undefined, $(`view-${S.view}`));
 }
-async function refreshData() { await loadData(); S.version = S.data.data_version; renderView(); }
+async function refreshData() {
+  await loadData();
+  for (const fn of HOOKS.afterLoad) await safeAsync(fn);
+  S.version = S.data.data_version;
+  renderView();
+}
 const typing = () => document.activeElement && document.activeElement.matches("textarea, input[type=search], input[type=text], input[type=number]");
 
 async function poll() {
@@ -798,6 +850,7 @@ async function poll() {
     S.data = await api("/api/state");
     S.lastFinished = S.data.finished_at;
     await loadData();
+    for (const fn of HOOKS.afterLoad) await fn();
     S.version = S.data.data_version;
   } catch (err) { $("pill-text").textContent = "Erreur : " + err.message; }
   onRoute();

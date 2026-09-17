@@ -17,15 +17,42 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import db, pipeline
+from . import db, extensions, pipeline
 from .paths import CONFIG_PATH, CSV_PATH, DATA_DIR, JSON_PATH
 from .paths import WEB_DIR as WEB
-from .scraper import ALL_SOURCES, DEFAULT_CONFIG, normalize_config
+from .scraper import DEFAULT_CONFIG, all_sources, normalize_config
 
 HOST = "127.0.0.1"
 PORT = 8765
 STATIC_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8"}
 MAX_LOGS = 800
+
+FEATURES_WEB_DIR = WEB / "features"
+SECRET_KEYS = ("secret", "token", "password", "key")
+MASK = "••••"
+
+
+def render_index(html: str, scripts: list[str]) -> str:
+    tags = "\n".join(f'<script src="/static/features/{name}"></script>' for name in sorted(scripts))
+    return html.replace("<!-- FEATURE_SCRIPTS -->", tags)
+
+
+def _is_secret(key: str) -> bool:
+    return any(s in key.lower() for s in SECRET_KEYS)
+
+
+def _masked(key: str, v):
+    if not (_is_secret(key) and v):
+        return v
+    return MASK + v[-4:] if len(str(v)) > 8 else MASK
+
+
+def public_config(cfg: dict) -> dict:
+    """Copie de la config sans exposer les secrets au navigateur."""
+    out = {**cfg, "integrations": {}}
+    for name, values in (cfg.get("integrations") or {}).items():
+        out["integrations"][name] = {k: _masked(k, v) for k, v in values.items()}
+    return out
 
 state = {
     "running": False, "stop": False, "trigger": None,
@@ -59,11 +86,27 @@ def load_config() -> dict:
     return cfg
 
 
+_config_lock = threading.Lock()
+
+
 def save_config(raw: dict) -> dict:
-    cfg = normalize_config(raw)
-    cfg["schedule"] = {**SCHEDULE_DEFAULT, **(raw.get("schedule") or {})}
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    return load_config()
+    with _config_lock:  # sérialise la lecture-fusion-écriture : deux sauvegardes concurrentes ne s'écrasent pas
+        previous = load_config().get("integrations", {})
+        raw = dict(raw)
+        if "integrations" not in raw:
+            raw["integrations"] = previous
+        else:
+            merged = {}
+            for name, values in (raw.get("integrations") or {}).items():
+                if not isinstance(values, dict):
+                    continue
+                old = previous.get(name, {})
+                merged[name] = {k: (old.get(k, "") if str(v).startswith(MASK) else v) for k, v in values.items()}
+            raw["integrations"] = {**previous, **merged}
+        cfg = normalize_config(raw)
+        cfg["schedule"] = {**SCHEDULE_DEFAULT, **(raw.get("schedule") or {})}
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return load_config()
 
 
 def push_log(msg: str) -> None:
@@ -194,7 +237,15 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         path, query = url.path, parse_qs(url.query)
         if path in ("/", "/index.html"):
-            self._file(WEB / "index.html", STATIC_TYPES[".html"])
+            scripts = [p.name for p in FEATURES_WEB_DIR.glob("*.js")] if FEATURES_WEB_DIR.exists() else []
+            html = render_index((WEB / "index.html").read_text(encoding="utf-8"), scripts)
+            self._send(200, html.encode("utf-8"), STATIC_TYPES[".html"])
+        elif path.startswith("/static/features/"):
+            target = (FEATURES_WEB_DIR / path.removeprefix("/static/features/")).resolve()
+            if FEATURES_WEB_DIR.resolve() not in target.parents or target.suffix != ".js":
+                self._json(404, {"error": "introuvable"})
+            else:
+                self._file(target, STATIC_TYPES[".js"])
         elif path.startswith("/static/"):
             target = (WEB / path.removeprefix("/static/")).resolve()
             if WEB.resolve() not in target.parents or target.suffix not in STATIC_TYPES:
@@ -223,14 +274,15 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/runs":
             self._json(200, db.list_runs())
         elif path == "/api/config":
-            self._json(200, {"config": load_config(), "defaults": {**DEFAULT_CONFIG, "schedule": SCHEDULE_DEFAULT},
-                             "all_sources": ALL_SOURCES})
+            self._json(200, {"config": public_config(load_config()),
+                             "defaults": {**DEFAULT_CONFIG, "sources": all_sources(), "schedule": SCHEDULE_DEFAULT},
+                             "all_sources": all_sources()})
         elif path == "/csv":
             self._file(CSV_PATH, "text/csv; charset=utf-8", download=True)
         elif path == "/json":
             self._file(JSON_PATH, "application/json; charset=utf-8", download=True)
         else:
-            self._json(404, {"error": "introuvable"})
+            self._dispatch("GET", path, query, {})
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -250,7 +302,7 @@ class Handler(BaseHTTPRequestHandler):
             push_log("Demande d'arrêt…")
             self._json(200, {"ok": True})
         elif path == "/api/config":
-            self._json(200, {"ok": True, "config": save_config(body.get("config") or {})})
+            self._json(200, {"ok": True, "config": public_config(save_config(body.get("config") or {}))})
         elif ROUTE_OFFER.match(path):
             offer = db.update_offer(int(ROUTE_OFFER.match(path).group(1)), body.get("status"), body.get("note"))
             self._json(200 if offer else 404, offer or {"error": "offre introuvable"})
@@ -266,10 +318,27 @@ class Handler(BaseHTTPRequestHandler):
             ok = db.merge_offers(int(body.get("keep", 0)), int(body.get("other", 0)))
             self._json(200 if ok else 400, {"ok": ok})
         else:
+            self._dispatch("POST", path, {}, body)
+
+    def _dispatch(self, method: str, path: str, query: dict, body: dict) -> None:
+        found = extensions.find_route(method, path)
+        if not found:
             self._json(404, {"error": "introuvable"})
+            return
+        route, match = found
+        try:
+            status, payload = route.handler(self, match, query, body)
+            self._json(status, payload)  # dans le try : un payload non sérialisable renvoie un 500 JSON, pas une connexion coupée
+        except Exception as e:
+            self._json(500, {"error": f"{route.handler.__name__}: {str(e)[:300]}"})
 
 
 def boot() -> None:
+    features = extensions.load_features()
+    if features:
+        print(f"Fonctionnalités : {', '.join(features)}")
+    for name, error in extensions.FAILED_FEATURES:
+        print(f"Fonctionnalité ignorée (erreur) : {name} — {error}")
     db.init()
     msg = db.import_legacy(JSON_PATH, DATA_DIR / "suivi.json", DATA_DIR / "historique.json")
     if msg:

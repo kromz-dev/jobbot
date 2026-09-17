@@ -87,3 +87,12 @@ def test_status_and_note_history(tmp_path):
     o = db.update_offer(oid, status="postule", note="Appeler Mme X", path=p)
     assert o["status"] == "postule" and o["note"] == "Appeler Mme X"
     assert [h["status"] for h in o["status_history"]] == ["postule"]
+
+
+def test_list_runs_never_exposes_integrations(tmp_path):
+    """Même une ligne ancienne (créée avant le correctif) ne doit jamais exposer de secret via /api/runs."""
+    p = setup(tmp_path)
+    db.start_run({"cities": ["Paris"], "integrations": {"francetravail": {"client_secret": "s3cr3t-value"}}}, path=p)
+    runs = db.list_runs(path=p)
+    assert "integrations" not in runs[0]["config"]
+    assert runs[0]["config"]["cities"] == ["Paris"]

@@ -17,12 +17,21 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from . import db
+from . import db, extensions
 from .paths import CONFIG_PATH, CSV_PATH, JSON_PATH
 from .scraper import normalize_config, scrape_all
 from .sources import ENRICHABLE, fetch_description
 
 LogFn = Callable[[str], None]
+
+
+def run_post_hooks(cfg: dict, summary: dict, log: LogFn) -> None:
+    """Appelle chaque fonctionnalité branchée ; une erreur n'interrompt ni la recherche ni les autres crochets."""
+    for hook in extensions.POST_RUN_HOOKS:
+        try:
+            hook(cfg, summary, log)
+        except Exception as e:  # noqa: BLE001 — une extension ne doit jamais casser la recherche
+            log(f"Extension {hook.__name__}: {str(e)[:200]}")
 
 
 def run(
@@ -51,7 +60,7 @@ def run(
 
     stopped = lambda: bool(stop_flag and stop_flag())  # noqa: E731
     db.init()
-    run_id = db.start_run(cfg, trigger=trigger)
+    run_id = db.start_run({k: v for k, v in cfg.items() if k != "integrations"}, trigger=trigger)
     summary: dict = {"run_id": run_id}
     try:
         listings = scrape_all(on_log=log, on_progress=on_progress, stop_flag=stop_flag, config=cfg, on_stat=keep_stats)
@@ -108,6 +117,7 @@ def run(
         log(f"Termine: {len(offers)} offres actives dont {summary['ff']} faisant fonction · "
             f"{ing['new_offers']} nouvelles · export {exported} lignes")
         summary["status"] = status
+        run_post_hooks(cfg, summary, log)
     except Exception as e:
         db.finish_run(run_id, status="erreur", error=str(e)[:500], duration_s=round(time.monotonic() - t0), per_source=stats)
         summary["status"] = "erreur"

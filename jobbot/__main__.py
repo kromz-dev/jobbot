@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from . import __version__
+from . import __version__, extensions
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -17,6 +17,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("scrape", help="lancer une recherche complète en ligne de commande")
     sub.add_parser("apply", help="ouvrir les meilleures offres une par une")
     args = parser.parse_args(argv)
+
+    extensions.load_features()  # scrape/apply ont aussi besoin des schémas, migrations, crochets et surcharges (le serveur le refait dans boot(), sans coût)
 
     if args.command == "scrape":
         from .pipeline import main as scrape_main
