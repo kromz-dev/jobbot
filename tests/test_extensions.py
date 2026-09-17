@@ -1,7 +1,17 @@
 import json
+import threading
+import urllib.request
+from http.server import ThreadingHTTPServer
 
-from jobbot import db, extensions, pipeline, scraper
+from jobbot import db, extensions, pipeline, scraper, server
 from jobbot.sources import SOURCES
+
+
+def _serve(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "CONFIG_PATH", tmp_path / "config.json")
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
 
 
 def test_route_registration_and_lookup(clean_extensions):
@@ -83,3 +93,60 @@ def test_load_features_imports_modules(clean_extensions, tmp_path, monkeypatch):
     assert "zz_demo_feature" in extensions.load_features()
     assert extensions.find_route("GET", "/api/zz-demo") is not None
     json.dumps(extensions.REGISTRIES)  # REGISTRIES est une liste de noms sérialisable
+
+
+def test_render_index_injects_feature_scripts():
+    html = "<body><script src='/static/app.js'></script>\n<!-- FEATURE_SCRIPTS -->\n</body>"
+    out = server.render_index(html, ["b.js", "a.js"])
+    assert '<script src="/static/features/a.js"></script>' in out
+    assert out.index("features/a.js") < out.index("features/b.js")
+    assert "FEATURE_SCRIPTS" not in out
+
+
+def test_public_config_masks_secrets():
+    cfg = {"integrations": {"francetravail": {"client_id": "PAR_abc", "client_secret": "s3cr3t-value-1234"}}}
+    pub = server.public_config(cfg)
+    assert pub["integrations"]["francetravail"]["client_id"] == "PAR_abc"
+    assert pub["integrations"]["francetravail"]["client_secret"] == "••••1234"
+    assert cfg["integrations"]["francetravail"]["client_secret"] == "s3cr3t-value-1234"  # original intact
+
+
+def test_save_config_preserves_integrations_and_masked_secrets(monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "CONFIG_PATH", tmp_path / "config.json")
+    server.save_config({"integrations": {"francetravail": {"client_id": "id1", "client_secret": "real-secret-9999"}}})
+    server.save_config({"radius_km": 12})  # le front n'envoie pas integrations
+    assert server.load_config()["integrations"]["francetravail"]["client_secret"] == "real-secret-9999"
+    server.save_config({"integrations": {"francetravail": {"client_id": "id2", "client_secret": "••••9999"}}})
+    saved = server.load_config()["integrations"]["francetravail"]
+    assert saved == {"client_id": "id2", "client_secret": "real-secret-9999"}
+
+
+def test_registered_route_served_over_http(clean_extensions, tmp_db, monkeypatch, tmp_path):
+    @extensions.route("POST", r"/api/echo/(\w+)")
+    def echo(req, match, query, body):
+        return 201, {"name": match.group(1), "body": body}
+
+    httpd, base = _serve(monkeypatch, tmp_path)
+    try:
+        req = urllib.request.Request(f"{base}/api/echo/abc", data=b'{"x": 1}', method="POST",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 201
+            assert json.loads(r.read()) == {"name": "abc", "body": {"x": 1}}
+    finally:
+        httpd.shutdown()
+
+
+def test_feature_script_served_and_injected(tmp_db, monkeypatch, tmp_path):
+    feats = tmp_path / "features"
+    feats.mkdir()
+    (feats / "demo.js").write_text("window.__demo = 1;", encoding="utf-8")
+    monkeypatch.setattr(server, "FEATURES_WEB_DIR", feats)
+    httpd, base = _serve(monkeypatch, tmp_path)
+    try:
+        with urllib.request.urlopen(f"{base}/") as r:
+            assert '/static/features/demo.js' in r.read().decode()
+        with urllib.request.urlopen(f"{base}/static/features/demo.js") as r:
+            assert r.read() == b"window.__demo = 1;"
+    finally:
+        httpd.shutdown()
